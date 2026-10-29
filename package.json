@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-tool-prefetch",
   "version": "0.1.0",
-  "description": "Tool-call prefetch predictor for DeepSeek Harness: spawns the CT-GNN gateway as a Python sidecar and registers its prediction + proxied upstream tools natively on ctx.tools.",
+  "description": "工具调用预测与预取插件：以 Python 边车方式拉起 CT-GNN 预测网关，把预测工具与上游工具原生注册到 ctx.tools——预测下一个工具调用、分层预热（L0-L3）、在线命中率遥测、训练数据自动采集。",
   "type": "module",
   "main": "index.js",
   "files": [
