@@ -1,0 +1,25 @@
+{
+  "name": "dsh-plugin-tool-prefetch",
+  "version": "0.1.0",
+  "description": "Tool-call prefetch predictor for DeepSeek Harness: spawns the CT-GNN gateway as a Python sidecar and registers its prediction + proxied upstream tools natively on ctx.tools.",
+  "type": "module",
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "mcp",
+    "prefetch",
+    "tool-call-prediction"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}

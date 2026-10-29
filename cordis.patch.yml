@@ -1,0 +1,13 @@
+# Bundle patch: mounts the tool-prefetch plugin with its sidecar config.
+# Users override these values by copying this row into their own profile's
+# cordis.patch.yml (e.g. ~/.dsh/profiles/web/cordis.patch.yml).
+- insert:
+  - id: tool-prefetch
+    name: dsh-plugin-tool-prefetch
+    config:
+      python: 'D:\code\my_job\agent-tool-acceleration\.venv\Scripts\python.exe'
+      repoRoot: 'D:\code\my_job\agent-tool-acceleration'
+      gatewayConfig: 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml'
+      toolPrefix: ''
+      initTimeoutMs: 60000
+      callTimeoutMs: 120000
