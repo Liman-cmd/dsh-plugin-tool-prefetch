@@ -1,13 +1,28 @@
 # Bundle patch: mounts the tool-prefetch plugin with its sidecar config.
 # Users override these values by copying this row into their own profile's
 # cordis.patch.yml (e.g. ~/.dsh/profiles/web/cordis.patch.yml).
+#
+# mode:
+#   tools        (default) register all gateway tools; the model calls them
+#                explicitly. Data capture needs the agent to pass _gateway/history.
+#   probe        register nothing, change nothing -- only log what the tool
+#                pipeline hooks deliver (run once to verify the hooks fire).
+#   interceptor  register NO tools; hook the pipeline and, asynchronously,
+#                report every execution to the gateway. Zero model tokens and
+#                zero agent cooperation -- prediction/warming happen while the
+#                model is still writing. This is the transparent-acceleration
+#                mode.
+#   both         interceptor + register just the gw_* tools (so a user can
+#                still ask for stats / model status by hand).
 - insert:
   - id: tool-prefetch
     name: dsh-plugin-tool-prefetch
     config:
+      mode: 'tools'
       python: 'D:\code\my_job\agent-tool-acceleration\.venv\Scripts\python.exe'
       repoRoot: 'D:\code\my_job\agent-tool-acceleration'
       gatewayConfig: 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml'
       toolPrefix: ''
+      sessionFrom: 'agent'   # interceptor: use exec.agent for session grouping
       initTimeoutMs: 60000
       callTimeoutMs: 120000

@@ -1,26 +1,30 @@
 // dsh-plugin-tool-prefetch — bridge the CT-GNN prefetch gateway into dsh.
 //
-// A zero-dependency Cordis plugin: spawns the Python gateway
-// (`python -m mcp_prefetch_gateway.cli rpc --config <yaml>`) as a sidecar,
-// speaks newline-delimited JSON-RPC 2.0 over stdio, and registers every tool
-// the gateway exposes (gw_predict_next / gw_observe / gw_stats / gw_reset plus
-// the proxied upstream tools) natively on ctx.tools.
+// Four modes (config.mode; default "tools"):
 //
-// Registration happens in the background: the sidecar takes ~20 s to cold
-// start (torch + model load), which must not block profile activation. Tools
-// appear as soon as the sidecar is ready. Disposing the plugin kills the
-// sidecar — that is the Settings -> Plugins on/off switch.
+//   tools        (v1) register every gateway tool via ctx.tools.register.
+//                     The model sees and calls them explicitly. Data capture
+//                     depends on the agent passing _gateway/history.
 //
-// Config (via the cordis row's `config`):
-//   python        absolute path to the venv python   (default: "python")
-//   repoRoot      the agent-tool-acceleration checkout (default: cwd)
-//   gatewayConfig gateway yaml, absolute or repo-relative
-//   toolPrefix    prefix for registered tool names   (default: "" = raw names)
-//   initTimeoutMs sidecar startup budget            (default: 60000)
+//   probe        Register NOTHING and change NOTHING; only hook the tool
+//                pipeline and log what the hooks deliver. Used once to verify
+//                that dsh fires these events and what exec.agent carries.
+//
+//   interceptor  Register no tools. Hook tools/pre-execute + tools/result and,
+//                fully asynchronously (never blocking the call), report every
+//                execution to the gateway so it scores predictions and warms
+//                the next-step tiers. Zero model tokens, zero agent cooperation
+//                -- prediction happens while the model is still writing.
+//
+//   both         interceptor + register only the gw_* tools (so a user can
+//                still query stats/model status by hand).
+//
+// All modes that talk to the gateway spawn the SAME Python sidecar and speak
+// newline-delimited JSON-RPC 2.0 on its stdio.
 
 import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
-import { isAbsolute, join, resolve } from 'node:path'
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 
 export const inject = ['tools']
 
@@ -63,6 +67,7 @@ class Sidecar {
     this.buffer = ''
     this.nextId = 1
     this.dead = false
+    this.ready = false  // true once initialize + tools/list succeeded
   }
 
   start() {
@@ -143,28 +148,223 @@ function mcpResultToValue(result) {
   return result ?? {}
 }
 
+// Best-effort text of a tool result, capped like the gateway's own summaries.
+function summarizeContent(result, maxChars = 200) {
+  try {
+    if (!result) return ''
+    if (Array.isArray(result.content)) {
+      const text = result.content
+        .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+        .map((b) => b.text)
+        .join(' ')
+      if (text) return text.slice(0, maxChars)
+    }
+    if (result.error) return String(result.error.message ?? result.error).slice(0, maxChars)
+    return JSON.stringify(mcpResultToValue(result)).slice(0, maxChars)
+  } catch {
+    return ''
+  }
+}
+
+// Safe structural description for probe logging (never throws, never recurses deep).
+function describe(value, depth = 0) {
+  if (value == null) return value
+  const t = typeof value
+  if (t === 'string') return value.length > 120 ? value.slice(0, 120) + '…' : value
+  if (t === 'number' || t === 'boolean') return value
+  if (t === 'function') return `[fn ${value.name || 'anonymous'}]`
+  if (Array.isArray(value)) return depth > 1 ? `[array(${value.length})]` : value.slice(0, 3).map((v) => describe(v, depth + 1))
+  if (t === 'object') {
+    if (depth > 1) return '[obj]'
+    const out = {}
+    for (const k of Object.keys(value).slice(0, 20)) {
+      if (k === 'signal' || k === 'schema' || k === 'toolSet') { out[k] = `[${typeof value[k]}]`; continue }
+      try { out[k] = describe(value[k], depth + 1) } catch { out[k] = '[unreadable]' }
+    }
+    return out
+  }
+  return String(value)
+}
+
+// Maps a dsh tool execution to a gateway session id, so interceptor-mode calls
+// group into conversations. `exec.agent` is the documented identity carrier;
+// the probe run confirms its exact shape, and we fall back to a time-window
+// bucket when it is absent so a missing field degrades instead of breaking.
+class SessionScope {
+  constructor(cfg) {
+    this.cfg = cfg
+    this.byAgent = new Map()
+    this.windowId = null
+    this.windowStart = 0
+    this.WINDOW_MS = 10 * 60 * 1000  // 10-minute conversation window fallback
+    this.lastUserMsg = null
+  }
+
+  idFor(exec) {
+    if (this.cfg.sessionFrom === 'agent') {
+      const agent = exec?.agent
+      const key = agent?.id ?? agent?.sessionId ?? agent?.session?.id ?? agent?.name
+      if (key != null) {
+        const s = String(key)
+        if (!this.byAgent.has(s)) this.byAgent.set(s, `dsh-${s}`)
+        return this.byAgent.get(s)
+      }
+    }
+    const now = Date.now()
+    if (!this.windowId || now - this.windowStart > this.WINDOW_MS) {
+      this.windowId = `dsh-w${Math.floor(now / this.WINDOW_MS)}`
+      this.windowStart = now
+    }
+    return this.windowId
+  }
+
+  userMsgFor(exec) {
+    // dsh does not hand us the user's text here; the gateway keeps the last
+    // known user_msg per session from gw_observe history, so returning null
+    // leaves that intact rather than overwriting it with nothing.
+    return null
+  }
+
+  latencyFor(_exec) {
+    return null  // measured inside the gateway when it needs to
+  }
+}
+
 export function apply(ctx, config = {}) {
   const cfg = {
+    mode: String(config.mode || 'tools').toLowerCase(),
     python: config.python || 'python',
     repoRoot: config.repoRoot ? resolve(config.repoRoot) : process.cwd(),
     gatewayConfig: '',
     toolPrefix: config.toolPrefix ?? '',
     initTimeoutMs: config.initTimeoutMs || 60000,
     callTimeoutMs: config.callTimeoutMs || 120000,
+    // interceptor: how to derive a session id from the tool execution
+    sessionFrom: config.sessionFrom || 'agent',  // 'agent' | 'none'
   }
   cfg.gatewayConfig = isAbsolute(config.gatewayConfig || '')
     ? config.gatewayConfig
     : join(cfg.repoRoot, config.gatewayConfig || 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml')
 
   const log = ctx.logger || console
+  const MODES = new Set(['tools', 'probe', 'interceptor', 'both'])
+  if (!MODES.has(cfg.mode)) {
+    log.warn?.(`[tool-prefetch] unknown mode "${cfg.mode}"; falling back to "tools"`)
+    cfg.mode = 'tools'
+  }
+  const registerTools = cfg.mode === 'tools' || cfg.mode === 'both'
+  const hookPipeline = cfg.mode === 'probe' || cfg.mode === 'interceptor' || cfg.mode === 'both'
+  const onlyGwTools = cfg.mode === 'both'
+
   if (!existsSync(cfg.python) && cfg.python !== 'python' && !cfg.python.includes('/')) {
     log.warn?.(`[tool-prefetch] python path may be invalid: ${cfg.python}`)
   }
 
-  const disposers = []
-  const sidecar = new Sidecar(cfg, log)
+  // ---- probe bookkeeping (mode: probe) -------------------------------------
+  const probeLog = (event, data) => {
+    if (cfg.mode !== 'probe') return
+    try {
+      const p = join(cfg.repoRoot, 'mcp_prefetch_gateway', 'logs', 'probe.log')
+      mkdirSync(dirname(p), { recursive: true })
+      appendFileSync(p, JSON.stringify({ ts: Date.now() / 1000, event, ...data }) + '\n')
+    } catch {}
+  }
+  const probeCounts = { pre: 0, result: 0, errors: 0 }
 
+  const disposers = []
+  // `probe` needs no gateway at all -- keep it dependency-free so a broken
+  // python path cannot prevent the one diagnostic we need.
+  const sidecar = registerTools || cfg.mode === 'interceptor' ? new Sidecar(cfg, log) : null
+  const scope = new SessionScope(cfg)
+
+  // ---- hook: pre-execute (waterfall) --------------------------------------
+  if (hookPipeline) {
+    ctx.on('tools/pre-execute', async (exec, next) => {
+      try {
+        if (cfg.mode === 'probe') {
+          probeCounts.pre += 1
+          probeLog('pre_execute', {
+            n: probeCounts.pre,
+            name: exec?.name,
+            args: describe(exec?.arguments),
+            callId: describe(exec?.callId),
+            hasAgent: exec?.agent != null,
+            agent: describe(exec?.agent),
+            keys: exec ? Object.keys(exec).slice(0, 25) : [],
+          })
+        } else if (sidecar?.ready) {
+          // fire-and-forget: never block the tool call, never alter its result
+          const sessionId = scope.idFor(exec)
+          void sidecar
+            .request('tools/call', {
+              name: 'gw_predict_next',
+              arguments: {
+                session_id: sessionId,
+                user_msg: scope.userMsgFor(exec),
+                run_prefetch: true,
+                top_k: 5,
+              },
+            }, cfg.callTimeoutMs)
+            .then((r) => {
+              const v = mcpResultToValue(r)
+              log.debug?.(`[tool-prefetch] predicted before ${exec?.name}: ${(v.predictions || []).map((p) => p.tool).join(', ')}`)
+            })
+            .catch((err) => log.debug?.(`[tool-prefetch] pre-execute predict failed: ${err.message}`))
+        }
+      } catch (err) {
+        probeCounts.errors += 1
+        log.debug?.(`[tool-prefetch] pre-execute hook error: ${err?.message}`)
+      }
+      // ALWAYS pass through unchanged: this hook exists only to observe.
+      return next()
+    })
+  }
+
+  // ---- hook: result (emit) ------------------------------------------------
+  if (hookPipeline) {
+    try {
+      ctx.on('tools/result', (exec, result) => {
+        try {
+          if (cfg.mode === 'probe') {
+            probeCounts.result += 1
+            probeLog('result', {
+              n: probeCounts.result,
+              name: exec?.name,
+              isError: result?.isError,
+              contentBlocks: Array.isArray(result?.content) ? result.content.length : null,
+              contentPreview: describe(result?.content?.[0]?.text ?? result?.content),
+              error: describe(result?.error),
+            })
+          } else if (sidecar?.ready) {
+            // The gateway auto-scores the outstanding prediction and records the
+            // training step. Fire-and-forget, same reasoning as above.
+            void sidecar
+              .request('tools/call', {
+                name: 'gw_observe',
+                arguments: {
+                  session_id: scope.idFor(exec),
+                  tool_name: exec?.name,
+                  result_summary: summarizeContent(result),
+                  latency_ms: scope.latencyFor(exec),
+                },
+              }, cfg.callTimeoutMs)
+              .catch((err) => log.debug?.(`[tool-prefetch] observe after ${exec?.name} failed: ${err.message}`))
+          }
+        } catch (err) {
+          probeCounts.errors += 1
+        }
+      })
+    } catch (err) {
+      log.warn?.(`[tool-prefetch] tools/result hook registration failed: ${err?.message}`)
+    }
+  }
+
+  // ---- tool registration (modes: tools / both) ----------------------------
   const init = (async () => {
+    if (!sidecar) {
+      log.info?.(`[tool-prefetch] mode=${cfg.mode}: hooks registered, no tools registered`)
+      return
+    }
     try {
       sidecar.start()
       await sidecar.request(
@@ -172,7 +372,7 @@ export function apply(ctx, config = {}) {
         {
           protocolVersion: '2025-06-18',
           capabilities: {},
-          clientInfo: { name: 'dsh-plugin-tool-prefetch', version: '0.1.0' },
+          clientInfo: { name: 'dsh-plugin-tool-prefetch', version: '0.2.0' },
         },
         cfg.initTimeoutMs
       )
@@ -180,8 +380,21 @@ export function apply(ctx, config = {}) {
         JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }) + '\n'
       )
       const listed = await sidecar.request('tools/list', {}, cfg.initTimeoutMs)
+      sidecar.ready = true
+      let count = 0
+      if (!registerTools) {
+        // interceptor mode: the hook path does the work; registering tools would
+        // both add tokens and let the model call the gateway directly.
+        log.info?.(
+          `[tool-prefetch] ready: mode=${cfg.mode}, no tools registered (hook-only)` +
+            ` -- gateway ${cfg.gatewayConfig}`
+        )
+        return
+      }
       for (const tool of listed.tools || []) {
         const rawName = tool.name
+        if (onlyGwTools && !rawName.startsWith('gw_')) continue  // both-mode: user-facing tools only
+        count += 1
         const definition = {
           name: cfg.toolPrefix + rawName,
           description: tool.description || `Gateway tool ${rawName}`,
@@ -205,10 +418,12 @@ export function apply(ctx, config = {}) {
             return value
           },
         }
-        const dispose = ctx.tools.register(definition)
-        disposers.push(dispose)
+        disposers.push(ctx.tools.register(definition))
       }
-      log.info?.(`[tool-prefetch] ready: ${(listed.tools || []).length} tools from ${cfg.gatewayConfig}`)
+      log.info?.(
+        `[tool-prefetch] ready: mode=${cfg.mode}, ${count} tools from ${cfg.gatewayConfig}` +
+          (hookPipeline ? ' (+pipeline hooks)' : '')
+      )
     } catch (err) {
       log.error?.(`[tool-prefetch] sidecar failed to start: ${err.message}`)
       sidecar.kill()
@@ -216,7 +431,7 @@ export function apply(ctx, config = {}) {
   })()
 
   ctx.on('dispose', () => {
-    sidecar.kill()
+    sidecar?.kill()
     while (disposers.length) disposers.pop()()
   })
 

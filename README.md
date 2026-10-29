@@ -9,6 +9,39 @@ DeepSeek Harness（dsh）插件：把 [agent-tool-acceleration](../mcp_prefetch_
 零 npm 依赖（纯 JS + `node:child_process`），预测由论文的 CT-GNN 模型提供
 （CPU，~15 ms/次）。
 
+## 四种模式（`config.mode`）
+
+| mode | 注册工具吗 | 挂钩子吗 | 用途 |
+|---|---|---|---|
+| **`tools`**（默认）| ✅ 全部 24 个 | ❌ | v1 显式版：模型能主动调预测/遥测工具；采集需 agent 传参 |
+| **`probe`** | ❌ | ✅ 只写日志 | 一次性验证：确认 dsh 会触发钩子、`exec.agent` 是什么形状 |
+| **`interceptor`** | ❌ | ✅ 自动采集+预测+预热 | **透明加速**：零 token、零 agent 配合；预测发生在模型还在写 reasoning 时 |
+| **`both`** | 仅 `gw_*`（7 个）| ✅ | 隐形加速 + 保留人工查询/切模型入口 |
+
+切换只改配置值，不用动代码：
+
+```yaml
+- insert:
+  - id: tool-prefetch
+    name: dsh-plugin-tool-prefetch
+    config:
+      mode: 'interceptor'      # ← 改这里
+      python: 'D:\...\.venv\Scripts\python.exe'
+      repoRoot: 'D:\...\agent-tool-acceleration'
+      gatewayConfig: 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml'
+      sessionFrom: 'agent'     # interceptor 用 exec.agent 分会话
+```
+
+### 验证钩子（`mode: probe`）
+
+装好后重启 dsh、随便调一个工具，然后：
+
+```powershell
+Get-Content D:\...\agent-tool-acceleration\mcp_prefetch_gateway\logs\probe.log -Tail 10
+```
+
+看到 `pre_execute` 行含 `agent` 字段 = 钩子可用。**探针不改任何行为**（`next()` 原样透传，本地已验证 0ms）。
+
 ## 这个仓库包含什么 / 不包含什么
 
 **本仓只有"桥"（约 8 KB JS）**，不含预测、采集、训练的实现——它们在配套的
