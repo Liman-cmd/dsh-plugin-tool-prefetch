@@ -366,6 +366,12 @@ export function apply(ctx, config = {}) {
     // by default; removals are index-shifting and stay opt-in.
     catalogApply: config.catalogApply !== false,
     catalogAllowRemovals: config.catalogAllowRemovals === true,
+    // AUTO model swap: the flywheel promotes a challenger by writing the
+    // gateway config; someone must tell the running gateway to pick it up, and
+    // the plugin is already talking to it. On by default (no restart needed);
+    // set false to require an explicit manual gw_switch_model.
+    autoModelSwap: config.autoModelSwap !== false,
+    modelSwapPollMs: Number(config.modelSwapPollMs) > 0 ? Number(config.modelSwapPollMs) : 300000,
   }
   cfg.gatewayConfig = isAbsolute(config.gatewayConfig || '')
     ? config.gatewayConfig
@@ -407,6 +413,8 @@ export function apply(ctx, config = {}) {
   const probeCounts = { pre: 0, result: 0, errors: 0 }
 
   const disposers = []
+  // interval handle for the auto model-swap poller (null when disabled)
+  let swapTimer = null
   // `probe` needs no gateway at all -- keep it dependency-free so a broken
   // python path cannot prevent the one diagnostic we need.
   const sidecar = registerTools || cfg.mode === 'interceptor' ? new Sidecar(cfg, log) : null
@@ -598,6 +606,22 @@ export function apply(ctx, config = {}) {
       sidecar.ready = true
       // First catalog snapshot, now that the gateway can receive it.
       publishCatalog('startup')
+      // AUTO model swap poller: cheap (one MCP call that usually no-ops), and it
+      // turns the flywheel's "promoted, please restart dsh" into a live swap.
+      if (cfg.autoModelSwap && !swapTimer) {
+        swapTimer = setInterval(() => {
+          if (!sidecar?.ready) return
+          void sidecar
+            .request('tools/call', { name: 'gw_apply_pending', arguments: {} }, cfg.callTimeoutMs)
+            .then((r) => {
+              const v = mcpResultToValue(r)
+              if (v?.swapped) log.info?.(`[tool-prefetch] auto-applied promoted model: ${v.model}`)
+            })
+            .catch((err) => log.debug?.(`[tool-prefetch] apply_pending failed: ${err.message}`))
+        }, cfg.modelSwapPollMs)
+        if (swapTimer.unref) swapTimer.unref()  // never keep the process alive for this
+        log.info?.(`[tool-prefetch] auto model swap enabled (poll ${Math.round(cfg.modelSwapPollMs / 1000)}s)`)
+      }
       let count = 0
       if (!registerTools) {
         // interceptor mode: the hook path does the work; registering tools would
@@ -648,6 +672,10 @@ export function apply(ctx, config = {}) {
   })()
 
   ctx.on('dispose', () => {
+    if (swapTimer) {
+      clearInterval(swapTimer)
+      swapTimer = null
+    }
     sidecar?.kill()
     while (disposers.length) disposers.pop()()
   })
