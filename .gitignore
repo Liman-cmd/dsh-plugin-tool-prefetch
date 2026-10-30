@@ -1,0 +1,5 @@
+# Test artifacts: some self-tests resolve repoRoot to their own cwd, which drops
+# a stray log dir here. Never commit it.
+mcp_prefetch_gateway/
+node_modules/
+*.log

@@ -13,10 +13,14 @@ DeepSeek Harness（dsh）插件：把 [agent-tool-acceleration](../mcp_prefetch_
 
 | mode | 注册工具吗 | 挂钩子吗 | 用途 |
 |---|---|---|---|
-| **`tools`**（默认）| ✅ 全部 24 个 | ❌ | v1 显式版：模型能主动调预测/遥测工具；采集需 agent 传参 |
+| **`interceptor`**（随包默认）| ❌ | ✅ 自动采集+预测+预热 | **透明加速**：零 token、零 agent 配合；预测发生在模型还在写 reasoning 时 |
+| **`tools`** | ✅ 全部 24 个 | ❌ | v1 显式版：模型能主动调预测/遥测工具；采集需 agent 传参 |
 | **`probe`** | ❌ | ✅ 只写日志 | 一次性验证：确认 dsh 会触发钩子、`exec.agent` 是什么形状 |
-| **`interceptor`** | ❌ | ✅ 自动采集+预测+预热 | **透明加速**：零 token、零 agent 配合；预测发生在模型还在写 reasoning 时 |
 | **`both`** | 仅 `gw_*`（7 个）| ✅ | 隐形加速 + 保留人工查询/切模型入口 |
+
+> 代码内缺省值是 `tools`；随包的 `cordis.patch.yml` 显式设成 `interceptor`。
+> interceptor 若拉不起 sidecar（网关没装/路径错），钩子照常 `next()` 透传，
+> 只是不上报——不会挡住任何工具调用。
 
 切换只改配置值，不用动代码：
 
@@ -32,7 +36,7 @@ DeepSeek Harness（dsh）插件：把 [agent-tool-acceleration](../mcp_prefetch_
       sessionFrom: 'agent'     # interceptor 用 exec.agent 分会话
 ```
 
-### 验证钩子（`mode: probe`）
+### 验证钩子 + 用户消息采集（`mode: probe`）
 
 装好后重启 dsh、随便调一个工具，然后：
 
@@ -40,7 +44,14 @@ DeepSeek Harness（dsh）插件：把 [agent-tool-acceleration](../mcp_prefetch_
 Get-Content D:\...\agent-tool-acceleration\mcp_prefetch_gateway\logs\probe.log -Tail 10
 ```
 
-看到 `pre_execute` 行含 `agent` 字段 = 钩子可用。**探针不改任何行为**（`next()` 原样透传，本地已验证 0ms）。
+看到含 `agentId` + `sessionUserFound: true` 的 `pre_execute` 行 = 钩子可用**且**能从
+`agent.session.log` 挖出用户原文。**探针不改任何行为**（`next()` 原样透传，实测 0ms）。
+
+用户消息藏在 `agent.session.log` 的 `user/message` 事件里，而注入的 AGENTS.md /
+skill 列表 / 时间上下文**同样是 `type:user/message` + `role:'user'`**，只有
+`data.source.kind` 不同（`agent-instructions` / `skill-catalog` / `time-context` …）。
+所以筛选用**白名单** `source.kind === 'user'`，不能只看 role。详见
+[`docs/interceptor-probe.md`](docs/interceptor-probe.md)。
 
 ## 这个仓库包含什么 / 不包含什么
 

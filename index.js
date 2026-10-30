@@ -14,7 +14,10 @@
 //                fully asynchronously (never blocking the call), report every
 //                execution to the gateway so it scores predictions and warms
 //                the next-step tiers. Zero model tokens, zero agent cooperation
-//                -- prediction happens while the model is still writing.
+//                -- prediction happens while the model is still writing. The
+//                user's own text is mined from agent.session.log (see
+//                isHumanTurn / SessionScope.userMsgFor), so the gateway gets the
+//                same signal it would from an explicit gw_ observe call.
 //
 //   both         interceptor + register only the gw_* tools (so a user can
 //                still query stats/model status by hand).
@@ -26,7 +29,24 @@ import { spawn } from 'node:child_process'
 import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 
+// Module-load breadcrumb: written the instant the bundle's entry is imported,
+// BEFORE apply() runs. Distinguishes "harness never loaded the module" from
+// "loaded but never called apply()" -- the ambiguity that made an earlier
+// probe inconclusive.
+try {
+  const probeDir = resolve(process.env.DSH_TOOL_PREFETCH_REPO || process.cwd(), 'mcp_prefetch_gateway', 'logs')
+  mkdirSync(probeDir, { recursive: true })
+  appendFileSync(
+    join(probeDir, 'plugin-load.log'),
+    JSON.stringify({ ts: Date.now() / 1000, event: 'module_imported', pid: process.pid }) + '\n'
+  )
+} catch {}
+
 export const inject = ['tools']
+
+// Bumped whenever the probe payload changes, so a fresh probe.log line can be
+// told apart from one written by a stale module instance.
+export const PROBE_VERSION = 3
 
 // JsonSchema keywords accepted by dsh's enforced subset; anything else is
 // stripped instead of being rejected at registration.
@@ -186,6 +206,87 @@ function describe(value, depth = 0) {
   return String(value)
 }
 
+// Deep probe for the ONE thing the tool hooks do not carry: the user's message
+// text. The session event log (also persisted to
+// .dsh/sessions/.../session.v4.jsonl.zstd) holds every surface event; a real
+// human turn looks like
+//   { type:'user/message', data:{ role:'user',
+//     source:{ kind:'user' }, content:[{type:'text', text:'...'}] } }
+// The injected context -- system-reminders, AGENTS.md, runtime snapshots, skill
+// catalogs, time context -- arrives with the SAME type:'user/message' and
+// role:'user' but a different source.kind (agent-instructions, runtime-context,
+// skill-catalog, time-context, ...). That set grows as dsh adds features, so we
+// ALLOWLIST kind:'user' instead of blocklisting what we have seen so far.
+function textFromContent(content) {
+  if (content == null) return null
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((c) => (typeof c === 'string' ? c : c?.text ?? c?.content ?? null))
+      .filter((x) => typeof x === 'string' && x.length)
+    return parts.length ? parts.join('\n') : null
+  }
+  if (typeof content === 'object') return textFromContent(content.content ?? content.text)
+  return null
+}
+
+function isHumanTurn(e) {
+  if (!e || typeof e !== 'object') return false
+  const d = e.data ?? e
+  const kind = d?.source?.kind ?? d?.sourceKind
+  // the ONLY thing a human typed carries source.kind === 'user'
+  if (kind != null) return kind === 'user'
+  // no source at all (older/hand-built logs): fall back to the role/type signal
+  const t = String(e.type ?? e.kind ?? e.event ?? '')
+  const role = String(d?.role ?? e.role ?? '')
+  return role === 'user' || /^user\/message$|^user-message$/.test(t)
+}
+
+function extractUserText(e) {
+  const d = e?.data ?? e
+  return (
+    textFromContent(d?.content) ??
+    textFromContent(d?.text) ??
+    textFromContent(d?.message) ??
+    textFromContent(d?.payload) ??
+    null
+  )
+}
+
+function probeSession(agent) {
+  const out = {
+    sessionUserFound: false,
+    sessionUserFrom: null,
+    sessionUserText: null,
+    sessionUserKind: null,
+    sessionProbes: {},
+  }
+  const sess = agent?.session
+  if (!sess || typeof sess !== 'object') return out
+  for (const key of ['log', 'derived', 'messages', 'events', 'header']) {
+    let arr
+    try { arr = sess[key] } catch { continue }
+    if (!Array.isArray(arr)) continue
+    out.sessionProbes[key] = {
+      len: arr.length,
+      sampleKeys: arr.slice(-3).map((x) => (x && typeof x === 'object' ? Object.keys(x).slice(0, 12) : typeof x)),
+      sampleTypes: arr.slice(-3).map((x) => (x && typeof x === 'object' ? (x.type ?? x.kind ?? null) : null)),
+    }
+    for (let i = arr.length - 1; i >= 0 && !out.sessionUserFound; i--) {
+      const e = arr[i]
+      if (!isHumanTurn(e)) continue
+      const s = extractUserText(e)
+      if (s && s.length) {
+        out.sessionUserFound = true
+        out.sessionUserFrom = `agent.session.${key}[${i}]`
+        out.sessionUserKind = String(e?.data?.source?.kind ?? e?.data?.role ?? e?.type ?? '')
+        out.sessionUserText = s.slice(0, 300)
+      }
+    }
+  }
+  return out
+}
+
 // Maps a dsh tool execution to a gateway session id, so interceptor-mode calls
 // group into conversations. `exec.agent` is the documented identity carrier;
 // the probe run confirms its exact shape, and we fall back to a time-window
@@ -198,6 +299,7 @@ class SessionScope {
     this.windowStart = 0
     this.WINDOW_MS = 10 * 60 * 1000  // 10-minute conversation window fallback
     this.lastUserMsg = null
+    this.userMsgCache = new Map()  // agentId -> { len, text }
   }
 
   idFor(exec) {
@@ -219,10 +321,29 @@ class SessionScope {
   }
 
   userMsgFor(exec) {
-    // dsh does not hand us the user's text here; the gateway keeps the last
-    // known user_msg per session from gw_observe history, so returning null
-    // leaves that intact rather than overwriting it with nothing.
-    return null
+    // The user's text is not part of the tool-execution payload; it lives in the
+    // session event log (agent.session.log), which we mine for the latest human
+    // turn. Cached per agent and re-scanned only when the log grows, so we do
+    // not walk the array on every single tool call. Returning null on a miss is
+    // deliberate: the gateway keeps the last known user_msg per session, so
+    // null leaves it intact instead of overwriting it with nothing.
+    const agent = exec?.agent
+    const id = agent?.id != null ? String(agent.id) : null
+    const log = agent?.session?.log
+    if (!id || !Array.isArray(log)) return null
+
+    const cached = this.userMsgCache.get(id)
+    if (cached && cached.len === log.length) return cached.text
+
+    let text = null
+    for (let i = log.length - 1; i >= 0 && text == null; i--) {
+      const e = log[i]
+      if (!isHumanTurn(e)) continue
+      const s = extractUserText(e)
+      if (s && s.length) text = s
+    }
+    this.userMsgCache.set(id, { len: log.length, text })
+    return text
   }
 
   latencyFor(_exec) {
@@ -247,6 +368,16 @@ export function apply(ctx, config = {}) {
     : join(cfg.repoRoot, config.gatewayConfig || 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml')
 
   const log = ctx.logger || console
+  // apply() reached: breadcrumb so we can tell "module imported but apply never
+  // ran" (Cordis waiting on inject) from "apply ran, hooks registered".
+  try {
+    const dir = join(cfg.repoRoot, 'mcp_prefetch_gateway', 'logs')
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(
+      join(dir, 'plugin-load.log'),
+      JSON.stringify({ ts: Date.now() / 1000, event: 'apply_called', mode: String(config.mode || 'tools') }) + '\n'
+    )
+  } catch {}
   const MODES = new Set(['tools', 'probe', 'interceptor', 'both'])
   if (!MODES.has(cfg.mode)) {
     log.warn?.(`[tool-prefetch] unknown mode "${cfg.mode}"; falling back to "tools"`)
@@ -283,14 +414,18 @@ export function apply(ctx, config = {}) {
       try {
         if (cfg.mode === 'probe') {
           probeCounts.pre += 1
+          const sp = probeSession(exec?.agent)
           probeLog('pre_execute', {
             n: probeCounts.pre,
+            v: PROBE_VERSION,
             name: exec?.name,
             args: describe(exec?.arguments),
             callId: describe(exec?.callId),
+            agentId: exec?.agent?.id ?? null,
             hasAgent: exec?.agent != null,
-            agent: describe(exec?.agent),
-            keys: exec ? Object.keys(exec).slice(0, 25) : [],
+            agentKeys: exec?.agent ? Object.keys(exec.agent).slice(0, 40) : [],
+            sessionKeys: exec?.agent?.session ? Object.keys(exec.agent.session).slice(0, 40) : [],
+            ...sp,
           })
         } else if (sidecar?.ready) {
           // fire-and-forget: never block the tool call, never alter its result
