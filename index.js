@@ -408,6 +408,72 @@ export function apply(ctx, config = {}) {
   const sidecar = registerTools || cfg.mode === 'interceptor' ? new Sidecar(cfg, log) : null
   const scope = new SessionScope(cfg)
 
+  // ---- tool catalog: what tools does THIS deployment actually have? ---------
+  // The gateway's graph was built offline against some fixed tool set; a real
+  // deployment's set drifts (plugins installed, MCP servers added, tools
+  // removed). Nothing else in the pipeline knows the live set, so we publish it:
+  // once at startup from ctx.tools.schemas(), and again on every tools/change
+  // (which fires for ANY registration/removal, unfiltered -- see dsh-tools).
+  // This is observability first: the gateway can only diff against a catalog it
+  // has been told about.
+  const catalogState = { last: null, sends: 0, errors: 0 }
+
+  const readCatalog = () => {
+    const schemas = ctx.tools?.schemas?.()
+    if (!Array.isArray(schemas)) return null
+    return schemas
+      .filter((s) => s && typeof s.name === 'string')
+      .map((s) => ({
+        name: s.name,
+        description: typeof s.description === 'string' ? s.description : '',
+        // parameters can be a large JSON Schema; keep it (the graph wants it)
+        // but leave serialization limits to the transport.
+        parameters: s.parameters && typeof s.parameters === 'object' ? s.parameters : {},
+      }))
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+  }
+
+  const publishCatalog = (reason) => {
+    const tools = readCatalog()
+    if (!tools) {
+      log.debug?.('[tool-prefetch] tool catalog unavailable (ctx.tools.schemas missing)')
+      return
+    }
+    const signature = tools.map((t) => `${t.name}:${t.description.length}`).join('|')
+    if (reason === 'change' && catalogState.last === signature) return  // no real change
+    catalogState.last = signature
+    catalogState.sends += 1
+    const payload = { tools, reason, at: Date.now() / 1000 }
+    // probe mode has no sidecar; still record it for inspection
+    if (cfg.mode === 'probe') {
+      probeLog('tool_catalog', { n: tools.length, names: tools.map((t) => t.name), reason })
+      return
+    }
+    if (!sidecar?.ready) return
+    void sidecar
+      .request('tools/call', { name: 'gw_register_tools', arguments: payload }, cfg.callTimeoutMs)
+      .then((r) => {
+        const v = mcpResultToValue(r)
+        log.info?.(
+          `[tool-prefetch] tool catalog published (${reason}): ${tools.length} tools` +
+            (v?.added != null ? `, +${v.added} -${v.removed} ~${v.updated}` : '')
+        )
+      })
+      .catch((err) => {
+        catalogState.errors += 1
+        log.debug?.(`[tool-prefetch] catalog publish failed: ${err.message}`)
+      })
+  }
+
+  if (cfg.mode !== 'probe') {
+    try {
+      ctx.on('tools/change', () => publishCatalog('change'))
+      disposers.push(() => {})
+    } catch (err) {
+      log.warn?.(`[tool-prefetch] tools/change hook failed: ${err?.message}`)
+    }
+  }
+
   // ---- hook: pre-execute (waterfall) --------------------------------------
   if (hookPipeline) {
     ctx.on('tools/pre-execute', async (exec, next) => {
@@ -516,6 +582,8 @@ export function apply(ctx, config = {}) {
       )
       const listed = await sidecar.request('tools/list', {}, cfg.initTimeoutMs)
       sidecar.ready = true
+      // First catalog snapshot, now that the gateway can receive it.
+      publishCatalog('startup')
       let count = 0
       if (!registerTools) {
         // interceptor mode: the hook path does the work; registering tools would
