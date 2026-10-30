@@ -362,6 +362,10 @@ export function apply(ctx, config = {}) {
     callTimeoutMs: config.callTimeoutMs || 120000,
     // interceptor: how to derive a session id from the tool execution
     sessionFrom: config.sessionFrom || 'agent',  // 'agent' | 'none'
+    // catalog reconciliation: applying additions is measured-safe, so it is on
+    // by default; removals are index-shifting and stay opt-in.
+    catalogApply: config.catalogApply !== false,
+    catalogAllowRemovals: config.catalogAllowRemovals === true,
   }
   cfg.gatewayConfig = isAbsolute(config.gatewayConfig || '')
     ? config.gatewayConfig
@@ -443,7 +447,17 @@ export function apply(ctx, config = {}) {
     if (reason === 'change' && catalogState.last === signature) return  // no real change
     catalogState.last = signature
     catalogState.sends += 1
-    const payload = { tools, reason, at: Date.now() / 1000 }
+    const payload = {
+      tools,
+      reason,
+      at: Date.now() / 1000,
+      // Additions are order-preserving and leave existing predictions
+      // bit-identical (measured), so folding them in is safe. Removals shift
+      // indices and change what the model sees, so they stay OBSERVE-ONLY here
+      // and are surfaced as a warning for a human/retrain to handle.
+      apply: cfg.catalogApply !== false,
+      allow_removals: cfg.catalogAllowRemovals === true,
+    }
     // probe mode has no sidecar; still record it for inspection
     if (cfg.mode === 'probe') {
       probeLog('tool_catalog', { n: tools.length, names: tools.map((t) => t.name), reason })
