@@ -412,6 +412,19 @@ export function apply(ctx, config = {}) {
   }
   const probeCounts = { pre: 0, result: 0, errors: 0 }
 
+  // Catalog diagnostics. The catalog is the one signal the gateway cannot
+  // observe for itself, so when it fails to arrive the symptom is silent
+  // (gateway keeps predicting against a stale tool set). This records every
+  // decision point in its (short, infrequent) lifecycle, always -- unlike
+  // probeLog, which is bound to mode=probe.
+  const catalogLog = (event, data) => {
+    try {
+      const p = join(cfg.repoRoot, 'mcp_prefetch_gateway', 'logs', 'catalog.log')
+      mkdirSync(dirname(p), { recursive: true })
+      appendFileSync(p, JSON.stringify({ ts: Date.now() / 1000, event, ...data }) + '\n')
+    } catch {}
+  }
+
   const disposers = []
   // interval handle for the auto model-swap poller (null when disabled)
   let swapTimer = null
@@ -428,11 +441,31 @@ export function apply(ctx, config = {}) {
   // (which fires for ANY registration/removal, unfiltered -- see dsh-tools).
   // This is observability first: the gateway can only diff against a catalog it
   // has been told about.
-  const catalogState = { last: null, sends: 0, errors: 0 }
+  const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false }
 
-  const readCatalog = () => {
-    const schemas = ctx.tools?.schemas?.()
-    if (!Array.isArray(schemas)) return null
+  const readCatalog = (agent) => {
+    // The viewing scope is a Context, not the agent object: dsh binds a scope
+    // key onto each agent's own ctx (scopeOf(agent.ctx) === agent), and
+    // `schemas(scope)` reads THAT scope's inherited tool surface. An agent's
+    // ctx therefore also admits the tools an agent preset registers, which the
+    // plugin's own (outer) ctx does not see -- that gap is why a bare call
+    // returned only the one globally-registered tool.
+    let schemas
+    const scope = agent && agent.ctx ? agent.ctx : undefined
+    try {
+      if (scope && typeof ctx.tools?.schemas === 'function') {
+        schemas = ctx.tools.schemas(scope)
+      } else {
+        schemas = ctx.tools?.schemas?.()
+      }
+    } catch (err) {
+      catalogLog('schemas-failed', { error: String(err?.message), scoped: !!scope })
+      schemas = ctx.tools?.schemas?.()
+    }
+    if (!Array.isArray(schemas)) {
+      catalogLog('schemas-not-array', { got: typeof schemas, scoped: !!scope })
+      return null
+    }
     return schemas
       .filter((s) => s && typeof s.name === 'string')
       .map((s) => ({
@@ -445,16 +478,30 @@ export function apply(ctx, config = {}) {
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
   }
 
-  const publishCatalog = (reason) => {
-    const tools = readCatalog()
+  const publishCatalog = (reason, agent) => {
+    // Shutdown churn: disposing a session unregisters every tool one by one, so
+    // tools/change fires N times in a burst. Publishing during teardown is both
+    // useless (the gateway may already be gone) and wrong (the set is mid-flight
+    // and will look like mass removal). Ignore changes once we are disposing.
+    if (catalogState.disposed && reason !== 'final') {
+      catalogLog('skipped-disposing', { reason })
+      return
+    }
+    const tools = readCatalog(agent)
     if (!tools) {
+      // Diagnosable: "no catalog published" must not be indistinguishable from
+      // "schemas() returned nothing" or "the sidecar never became ready".
+      catalogLog('unavailable', { reason, hasSchemas: typeof ctx.tools?.schemas === 'function' })
       log.debug?.('[tool-prefetch] tool catalog unavailable (ctx.tools.schemas missing)')
       return
     }
     const signature = tools.map((t) => `${t.name}:${t.description.length}`).join('|')
-    if (reason === 'change' && catalogState.last === signature) return  // no real change
-    catalogState.last = signature
-    catalogState.sends += 1
+    // Dedupe on EVERY reason: the refresh burst must converge (stop once the set
+    // settles) and a repeated tools/change must not re-send identical content.
+    if (catalogState.last === signature) {
+      catalogLog('unchanged', { reason, n: tools.length })
+      return
+    }
     const payload = {
       tools,
       reason,
@@ -469,13 +516,32 @@ export function apply(ctx, config = {}) {
     // probe mode has no sidecar; still record it for inspection
     if (cfg.mode === 'probe') {
       probeLog('tool_catalog', { n: tools.length, names: tools.map((t) => t.name), reason })
+      catalogState.last = signature
       return
     }
-    if (!sidecar?.ready) return
+    if (!sidecar?.ready) {
+      // Do not drop it: dsh can fire tools/change before our sidecar finishes
+      // its cold start, and losing that snapshot would leave the gateway blind
+      // until some later change. Remember the debt and settle it on ready.
+      // `last` stays untouched so the deferred content is really sent later.
+      catalogState.pending = true
+      catalogLog('deferred-until-ready', { reason, n: tools.length })
+      return
+    }
+    catalogState.last = signature
+    catalogState.sends += 1
+    catalogLog('sending', { reason, n: tools.length, names: tools.map((t) => t.name) })
     void sidecar
       .request('tools/call', { name: 'gw_register_tools', arguments: payload }, cfg.callTimeoutMs)
       .then((r) => {
         const v = mcpResultToValue(r)
+        catalogLog('sent', {
+          reason, n: tools.length,
+          added: v?.added, inSync: v?.in_sync,
+          error: v?.error,                 // the gateway's own message, when it failed
+          rawKeys: v && typeof v === 'object' ? Object.keys(v).slice(0, 12) : String(v),
+          isError: r?.isError,
+        })
         log.info?.(
           `[tool-prefetch] tool catalog published (${reason}): ${tools.length} tools` +
             (v?.added != null ? `, +${v.added} -${v.removed} ~${v.updated}` : '')
@@ -483,6 +549,8 @@ export function apply(ctx, config = {}) {
       })
       .catch((err) => {
         catalogState.errors += 1
+        catalogState.last = null      // allow a retry to re-send this content
+        catalogLog('send-failed', { reason, n: tools.length, error: String(err?.message) })
         log.debug?.(`[tool-prefetch] catalog publish failed: ${err.message}`)
       })
   }
@@ -491,7 +559,9 @@ export function apply(ctx, config = {}) {
     try {
       ctx.on('tools/change', () => publishCatalog('change'))
       disposers.push(() => {})
+      catalogLog('change-hook-registered')
     } catch (err) {
+      catalogLog('change-hook-failed', { error: String(err?.message) })
       log.warn?.(`[tool-prefetch] tools/change hook failed: ${err?.message}`)
     }
   }
@@ -516,6 +586,12 @@ export function apply(ctx, config = {}) {
             ...sp,
           })
         } else if (sidecar?.ready) {
+          // The hook carries exec.agent -- a real viewing scope. Unlike the
+          // bare global view available at startup, this sees agent-scoped
+          // registrations too, so it is the reliable moment to refresh the
+          // catalog. Deduped by signature downstream, so calling it per call is
+          // cheap (a one-line "unchanged" when nothing moved).
+          if (exec?.agent) publishCatalog('agent', exec.agent)
           // fire-and-forget: never block the tool call, never alter its result
           const sessionId = scope.idFor(exec)
           void sidecar
@@ -604,8 +680,33 @@ export function apply(ctx, config = {}) {
       )
       const listed = await sidecar.request('tools/list', {}, cfg.initTimeoutMs)
       sidecar.ready = true
+      catalogLog('sidecar-ready', { tools: (listed.tools || []).length, mode: cfg.mode })
       // First catalog snapshot, now that the gateway can receive it.
       publishCatalog('startup')
+      if (catalogState.pending) {
+        catalogState.pending = false
+        catalogLog('settling-deferred')
+        publishCatalog('refresh')
+      }
+      // dsh registers its built-in tools around plugin load, and the observed
+      // `tools/change` burst can land BEFORE our cold-start sidecar is ready
+      // (it takes ~15s to load torch). Relying on that single event left the
+      // catalog at whatever was registered at that instant. Re-poll a few times
+      // after ready so a growing set converges without depending on dsh's
+      // registration timing.
+      if (!catalogState.refreshTimer) {
+        let rounds = 0
+        catalogState.refreshTimer = setInterval(() => {
+          rounds += 1
+          if (sidecar?.ready) publishCatalog('refresh')
+          if (rounds >= 6) {           // ~60s of convergence, then stop
+            clearInterval(catalogState.refreshTimer)
+            catalogState.refreshTimer = null
+            catalogLog('refresh-settled', { rounds })
+          }
+        }, 10000)
+        if (catalogState.refreshTimer.unref) catalogState.refreshTimer.unref()
+      }
       // AUTO model swap poller: cheap (one MCP call that usually no-ops), and it
       // turns the flywheel's "promoted, please restart dsh" into a live swap.
       if (cfg.autoModelSwap && !swapTimer) {
@@ -666,12 +767,21 @@ export function apply(ctx, config = {}) {
           (hookPipeline ? ' (+pipeline hooks)' : '')
       )
     } catch (err) {
+      catalogLog('sidecar-failed', { error: String(err?.message) })
       log.error?.(`[tool-prefetch] sidecar failed to start: ${err.message}`)
       sidecar.kill()
     }
   })()
 
   ctx.on('dispose', () => {
+    // Set BEFORE killing anything: tearing a session down unregisters its tools
+    // one at a time, so tools/change fires a burst that would otherwise look
+    // like a mass removal and be published as such.
+    catalogState.disposed = true
+    if (catalogState.refreshTimer) {
+      clearInterval(catalogState.refreshTimer)
+      catalogState.refreshTimer = null
+    }
     if (swapTimer) {
       clearInterval(swapTimer)
       swapTimer = null
