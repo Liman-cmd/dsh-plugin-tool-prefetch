@@ -34,7 +34,23 @@ DeepSeek Harness（dsh）插件：把 [agent-tool-acceleration](../mcp_prefetch_
       repoRoot: 'D:\...\agent-tool-acceleration'
       gatewayConfig: 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml'
       sessionFrom: 'agent'     # interceptor 用 exec.agent 分会话
+      catalogApply: true       # 新增工具并入服务图（实测保序、已有预测逐位不变）
+      catalogAllowRemovals: false   # 删除会移位索引，需显式开
+      autoModelSwap: true      # 飞轮晋升后自动应用（免重启 dsh）
+      modelSwapPollMs: 300000  # 轮询间隔
 ```
+
+### 工具目录上报（自动，无需配置）
+
+插件在启动时取 `ctx.tools.schemas()`、并监听 `tools/change`（dsh 未过滤注册表通知，任何工具
+增删/权限变化都触发）增量上报实际工具集。网关据此与离线产物 diff——**这是"命中率莫名下降"
+最常见的隐藏原因**，现在会明确告警（`cli health` 或 `gw_tool_catalog` 可见）。
+
+### 自动换模型（`autoModelSwap`）
+
+飞轮过闸后会写网关配置，但运行中的网关是插件的子进程（不同进程），原先需重启 dsh 才生效。
+开着这个开关，插件定期调 `gw_apply_pending`，配置变了就地热切换。关掉即回到纯手动
+（只有显式 `gw_switch_model` / `cli switch-model` 才换）。
 
 ### 验证钩子 + 用户消息采集（`mode: probe`）
 
