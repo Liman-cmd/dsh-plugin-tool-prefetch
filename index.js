@@ -441,7 +441,7 @@ export function apply(ctx, config = {}) {
   // (which fires for ANY registration/removal, unfiltered -- see dsh-tools).
   // This is observability first: the gateway can only diff against a catalog it
   // has been told about.
-  const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false, changeTimer: null, pendingChange: false }
+  const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false, changeTimer: null, pendingChange: false, maxSeen: 0 }
 
   const readCatalog = (agent) => {
     // The viewing scope IS the agent object: dsh's own tool runtime calls
@@ -505,6 +505,19 @@ export function apply(ctx, config = {}) {
       catalogLog('skipped-empty', { reason })
       return
     }
+    // View downgrade guard. Two views exist and they see different amounts:
+    //   * a scoped (agent) view sees the preset's tools   -> e.g. 31
+    //   * a bare global view sees only unscoped tools     -> e.g. 1
+    // A timer-driven `refresh` has no agent, so it would publish the global
+    // view and overwrite the good 31 with 1 -- a bogus "30 tools removed".
+    // Once a richer view is known, a smaller one is a downgrade, not news.
+    if (tools.length < catalogState.maxSeen) {
+      catalogLog('skipped-downgrade', {
+        reason, n: tools.length, maxSeen: catalogState.maxSeen,
+      })
+      return
+    }
+    catalogState.maxSeen = tools.length
     // Dedupe on EVERY reason: the refresh burst must converge (stop once the set
     // settles) and a repeated tools/change must not re-send identical content.
     if (catalogState.last === signature) {
