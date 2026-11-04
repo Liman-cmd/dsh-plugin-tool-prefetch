@@ -441,7 +441,7 @@ export function apply(ctx, config = {}) {
   // (which fires for ANY registration/removal, unfiltered -- see dsh-tools).
   // This is observability first: the gateway can only diff against a catalog it
   // has been told about.
-  const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false }
+  const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false, changeTimer: null, pendingChange: false }
 
   const readCatalog = (agent) => {
     // The viewing scope IS the agent object: dsh's own tool runtime calls
@@ -496,6 +496,15 @@ export function apply(ctx, config = {}) {
       return
     }
     const signature = tools.map((t) => `${t.name}:${t.description.length}`).join('|')
+    // Never publish an EMPTY catalog. An empty set is almost always a transient
+    // (mid-teardown, or a scope that resolves to nothing) rather than "the
+    // deployment deleted every tool"; publishing it would tell the gateway that
+    // all tools vanished and, with removals allowed, wreck its graph. Absence of
+    // evidence is not evidence of absence.
+    if (tools.length === 0) {
+      catalogLog('skipped-empty', { reason })
+      return
+    }
     // Dedupe on EVERY reason: the refresh burst must converge (stop once the set
     // settles) and a repeated tools/change must not re-send identical content.
     if (catalogState.last === signature) {
@@ -557,7 +566,22 @@ export function apply(ctx, config = {}) {
 
   if (cfg.mode !== 'probe') {
     try {
-      ctx.on('tools/change', () => publishCatalog('change'))
+      // tools/change fires once PER registration, so mounting a preset emits a
+      // burst (observed: 60+ events inside ~200 ms). Publishing on each one
+      // serializes the whole tool set 60 times and, worse, captures mid-flight
+      // states. Coalesce: wait for the burst to go quiet, then publish once.
+      ctx.on('tools/change', () => {
+        catalogState.pendingChange = true
+        if (catalogState.changeTimer) return
+        catalogState.changeTimer = setTimeout(() => {
+          catalogState.changeTimer = null
+          if (catalogState.pendingChange) {
+            catalogState.pendingChange = false
+            publishCatalog('change')
+          }
+        }, 500)
+        if (catalogState.changeTimer.unref) catalogState.changeTimer.unref()
+      })
       disposers.push(() => {})
       catalogLog('change-hook-registered')
     } catch (err) {
@@ -778,6 +802,10 @@ export function apply(ctx, config = {}) {
     // one at a time, so tools/change fires a burst that would otherwise look
     // like a mass removal and be published as such.
     catalogState.disposed = true
+    if (catalogState.changeTimer) {
+      clearTimeout(catalogState.changeTimer)
+      catalogState.changeTimer = null
+    }
     if (catalogState.refreshTimer) {
       clearInterval(catalogState.refreshTimer)
       catalogState.refreshTimer = null
