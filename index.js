@@ -444,14 +444,14 @@ export function apply(ctx, config = {}) {
   const catalogState = { last: null, sends: 0, errors: 0, pending: false, refreshTimer: null, disposed: false }
 
   const readCatalog = (agent) => {
-    // The viewing scope is a Context, not the agent object: dsh binds a scope
-    // key onto each agent's own ctx (scopeOf(agent.ctx) === agent), and
-    // `schemas(scope)` reads THAT scope's inherited tool surface. An agent's
-    // ctx therefore also admits the tools an agent preset registers, which the
-    // plugin's own (outer) ctx does not see -- that gap is why a bare call
-    // returned only the one globally-registered tool.
+    // The viewing scope IS the agent object: dsh's own tool runtime calls
+    // `chainLayers(exec.agent)` for scoped lookups, and a scope key is the
+    // agent itself (a test asserts scopeOf(agent.ctx) === agent -- the ctx
+    // CARRIES the key, it is not the key). Passing agent.ctx instead makes
+    // chainLayers see no parent chain and silently fall back to the global
+    // layer, which is exactly the 1-tool result this used to produce.
     let schemas
-    const scope = agent && agent.ctx ? agent.ctx : undefined
+    const scope = agent || undefined
     try {
       if (scope && typeof ctx.tools?.schemas === 'function') {
         schemas = ctx.tools.schemas(scope)
