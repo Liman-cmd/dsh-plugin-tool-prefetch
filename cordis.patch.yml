@@ -22,7 +22,15 @@
       mode: 'interceptor'
       python: 'D:\code\my_job\agent-tool-acceleration\.venv\Scripts\python.exe'
       repoRoot: 'D:\code\my_job\agent-tool-acceleration'
-      gatewayConfig: 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml'
+      # The deployment, NOT the paper benchmark: `runs/app_dsh/` is
+      # self-contained (its own telemetry, catalog and markov counts) and runs
+      # `predict.mode: markov`, so it learns from this harness's real calls.
+      #
+      # The old value pointed at a config whose model was trained on 16
+      # tau-bench *retail* tools. Its overlap with this deployment's tools is
+      # ZERO, so every score came out 0.0 and the "ranking" was alphabetical --
+      # a confident-looking answer carrying no information.
+      gatewayConfig: 'runs/app_dsh/config.yaml'
       toolPrefix: ''
       sessionFrom: 'agent'   # interceptor: use exec.agent for session grouping
       initTimeoutMs: 60000

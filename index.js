@@ -373,9 +373,13 @@ export function apply(ctx, config = {}) {
     autoModelSwap: config.autoModelSwap !== false,
     modelSwapPollMs: Number(config.modelSwapPollMs) > 0 ? Number(config.modelSwapPollMs) : 300000,
   }
+  // Fallback must name the DEPLOYMENT, not a paper benchmark config: the old
+  // default pointed at a model trained on 16 tau-bench retail tools, whose
+  // overlap with a coding harness is zero -- a missing `gatewayConfig` would
+  // silently serve uninformed (alphabetical) predictions instead of failing.
   cfg.gatewayConfig = isAbsolute(config.gatewayConfig || '')
     ? config.gatewayConfig
-    : join(cfg.repoRoot, config.gatewayConfig || 'mcp_prefetch_gateway/configs/tau_retail_gpt4o_real.yaml')
+    : join(cfg.repoRoot, config.gatewayConfig || 'runs/app_dsh/config.yaml')
 
   const log = ctx.logger || console
   // apply() reached: breadcrumb so we can tell "module imported but apply never
