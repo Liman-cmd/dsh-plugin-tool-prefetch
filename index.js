@@ -515,6 +515,13 @@ export function apply(ctx, config = {}) {
     // A timer-driven `refresh` has no agent, so it would publish the global
     // view and overwrite the good 31 with 1 -- a bogus "30 tools removed".
     // Once a richer view is known, a smaller one is a downgrade, not news.
+    //
+    // maxSeen must SURVIVE A RESTART. It used to be a plain in-memory counter,
+    // so the first `startup` publish after a restart -- taken from the bare
+    // global view -- reset the known-good set to 1 and permanently discarded
+    // the other 30 (measured: a 31-tool catalog written as
+    // {"working_directory"} alone). It is seeded from the gateway's persisted
+    // catalog below, which is the only place that remembers across processes.
     if (tools.length < catalogState.maxSeen) {
       catalogLog('skipped-downgrade', {
         reason, n: tools.length, maxSeen: catalogState.maxSeen,
@@ -522,6 +529,7 @@ export function apply(ctx, config = {}) {
       return
     }
     catalogState.maxSeen = tools.length
+    catalogLog('maxSeen', { reason, n: tools.length })
     // Dedupe on EVERY reason: the refresh burst must converge (stop once the set
     // settles) and a repeated tools/change must not re-send identical content.
     if (catalogState.last === signature) {
@@ -722,6 +730,30 @@ export function apply(ctx, config = {}) {
       const listed = await sidecar.request('tools/list', {}, cfg.initTimeoutMs)
       sidecar.ready = true
       catalogLog('sidecar-ready', { tools: (listed.tools || []).length, mode: cfg.mode })
+
+      // Seed the downgrade guard from the gateway's PERSISTED catalog. This
+      // process has just started, so its own maxSeen is 0; the startup publish
+      // below comes from the bare global view (1 tool) and would otherwise be
+      // accepted as the new truth, discarding a richer set observed before the
+      // restart. The gateway's catalog file is the only cross-process memory.
+      try {
+        const snap = await sidecar.request(
+          'tools/call',
+          { name: 'gw_stats', arguments: {} },
+          cfg.callTimeoutMs
+        )
+        const body = mcpResultToValue(snap) || {}
+        const catalog = body.tool_catalog || {}
+        const known = Number(catalog.n_catalog || 0)
+        if (Number.isFinite(known) && known > catalogState.maxSeen) {
+          catalogState.maxSeen = known
+          catalogLog('maxSeen-seeded', { from: 'gateway catalog', n: known })
+        }
+      } catch (err) {
+        // Diagnostics only: a failed seed must not block startup.
+        catalogLog('maxSeen-seed-failed', { error: String(err && err.message) })
+      }
+
       // First catalog snapshot, now that the gateway can receive it.
       publishCatalog('startup')
       if (catalogState.pending) {
